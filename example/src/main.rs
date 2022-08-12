@@ -8,7 +8,7 @@ use ouroboros::self_referencing;
 use rocksdb;
 
 mod rlp_path;
-use rlp_path::{ListNthValue, RlpPath};
+use rlp_path::RlpPath;
 
 
 const fn empty_nodes() -> [MerkleValue; 16] {
@@ -61,86 +61,71 @@ impl<'a> Deref for DbValueRef<'a> {
 }
 
 #[self_referencing]
-pub struct RlpWithDbValueRef<'a, P> {
+pub struct RlpWithDbValueRef<'a> {
     value_ref: DbValueRef<'a>,
-    rlp_path: P,
-    #[borrows(value_ref)]
+    rlp_path: RlpPath,
+    #[borrows(value_ref, rlp_path)]
     #[covariant]
     rlp: Rlp<'this>,
 }
 
-impl<'a, P: RlpPath + Copy> RlpWithDbValueRef<'a, P> {
+impl<'a> RlpWithDbValueRef<'a> {
     fn get_ref(&self) -> DbValueRef<'a> {
         self.borrow_value_ref().clone()
     }
-
-    fn get_path(&self) -> P {
-        *self.borrow_rlp_path()
-    }
 }
-//
-// impl<'a> Deref for RlpWithDbValueRef<'a> {
-//     type Target = Rlp<'a>;
-//
-//     fn deref(&self) -> &Rlp<'a> {
-//         &self.rlp
-//     }
-// }
 
 #[self_referencing]
-pub struct BytesWithDbValueRef<'a, P> {
+pub struct BytesWithDbValueRef<'a> {
     value_ref: DbValueRef<'a>,
-    rlp_path: P,
-    #[borrows(value_ref)]
+    rlp_path: RlpPath,
+    #[borrows(value_ref, rlp_path)]
     bytes: &'this [u8],
 }
 
-// impl<'a> Deref for BytesWithDbValueRef<'a> {
-//     type Target = [u8];
-//
-//     fn deref(&self) -> &[u8] {
-//         self.bytes
-//     }
-// }
+impl<'a> Deref for BytesWithDbValueRef<'a> {
+    type Target = [u8];
 
-
-pub enum MerkleNode<'a, P> {
-    Leaf(Vec<u8>, BytesWithDbValueRef<'a, P>),
-    Branch([MerkleValue; 16], Option<BytesWithDbValueRef<'a, P>>),
+    fn deref(&self) -> &[u8] {
+        self.borrow_bytes()
+    }
 }
 
-impl<'a, PIn: RlpPath + Copy> MerkleNode<'a, ListNthValue<PIn>> {
-    fn decode(rlp: RlpWithDbValueRef<'a, PIn>) -> Self {
+
+pub enum MerkleNode<'a> {
+    Leaf(Vec<u8>, BytesWithDbValueRef<'a>),
+    Branch([MerkleValue; 16], Option<BytesWithDbValueRef<'a>>),
+}
+
+impl<'a> MerkleNode<'a> {
+    fn decode(rlp: RlpWithDbValueRef<'a>) -> Self {
         let node = match dbg!(rlp.borrow_rlp().prototype().unwrap()) {
             Prototype::List(2) => {
-                let path = ListNthValue::new(rlp.get_path(), 1);
                 let new_bytes = BytesWithDbValueRefBuilder {
                     value_ref: rlp.get_ref(),
-                    rlp_path: path,
-                    bytes_builder: |r: &DbValueRef| path.get_bytes(r)
-                }.build(); // TODO: implement rlp.borrow_rlp().at(1).unwrap().data().unwrap()
+                    rlp_path: RlpPath::new(rlp.borrow_rlp_path(), 1),
+                    bytes_builder: |r: &DbValueRef, p: &RlpPath| p.get_subslice(r)
+                }.build();
                 MerkleNode::Leaf(vec![], new_bytes)
             }
             Prototype::List(17) => {
                 let mut nodes: [MerkleValue; 16] = empty_nodes();
                 for (i, node) in nodes.iter_mut().enumerate() {
-                    let path = ListNthValue::new(rlp.get_path(), i);
                     let new_rlp = RlpWithDbValueRefBuilder {
                         value_ref: rlp.get_ref(),
-                        rlp_path: path,
-                        rlp_builder: |r: &DbValueRef| Rlp::new(path.get_bytes(r))
-                    }.build(); // TODO: implement rlp.borrow_rlp().at(i).unwrap()
+                        rlp_path: RlpPath::new(rlp.borrow_rlp_path(), i),
+                        rlp_builder: |r: &DbValueRef, p: &RlpPath| Rlp::new(p.get_subslice(r))
+                    }.build();
                     *node = MerkleValue::decode(new_rlp);
                 }
                 let value = if rlp.borrow_rlp().at(16).unwrap().is_empty() {
                     None
                 } else {
-                    let path = ListNthValue::new(rlp.get_path(), 16);
                     let new_bytes = BytesWithDbValueRefBuilder {
                         value_ref: rlp.get_ref(),
-                        rlp_path: path,
-                        bytes_builder: |r: &DbValueRef| path.get_bytes(r)
-                    }.build(); // TODO: implement rlp.borrow_rlp().at(16).unwrap().data().unwrap()
+                        rlp_path: RlpPath::new(rlp.borrow_rlp_path(), 16),
+                        bytes_builder: |r: &DbValueRef, p: &RlpPath| p.get_subslice(r)
+                    }.build();
                     Some(new_bytes)
                 };
                 MerkleNode::Branch(nodes, value)
@@ -159,7 +144,7 @@ pub enum MerkleValue {
 
 impl MerkleValue {
     /// Given a RLP, decode it to a merkle value.
-    pub fn decode<P: RlpPath + Copy>(rlp: RlpWithDbValueRef<P>) -> Self {
+    pub fn decode(rlp: RlpWithDbValueRef) -> Self {
         if rlp.borrow_rlp().is_empty() {
             return MerkleValue::Empty;
         }
@@ -173,12 +158,12 @@ impl MerkleValue {
 }
 
 
-fn get_from_db(database: &MyStruct) -> MerkleNode<ListNthValue<rlp_path::Empty>> {
+fn get_from_db(database: &MyStruct) -> MerkleNode {
     let bytes = database.get(H256::default());
     let rlp = RlpWithDbValueRefBuilder {
         value_ref: bytes,
-        rlp_path: rlp_path::Empty{},
-        rlp_builder: |r: &DbValueRef| Rlp::new(r),
+        rlp_path: RlpPath::default(),
+        rlp_builder: |r: &DbValueRef, _| Rlp::new(r),
     }.build();
     MerkleNode::decode(rlp)
 }
@@ -196,16 +181,6 @@ fn main() {
     s.begin_list(2);
     s.append(&"cat").append(&rlp_inner_bytes);
     let rlp_bytes = s.out();
-
-    let p = rlp_path::Empty{};
-    let p = rlp_path::ListNthValue { parent: p, i: 1 };
-    let p = rlp_path::ListNthValue { parent: p, i: 1 };
-
-    dbg!(p.get_bytes(&rlp_bytes));
-
-    // let rlp = Rlp::new(&rlp_bytes);
-    // dbg!(rlp.clone());
-    // dbg!(rlp.at(1).unwrap());
 
 
     db.data.insert(H256::default(), rlp_bytes.to_vec());

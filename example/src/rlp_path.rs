@@ -1,35 +1,25 @@
+use std::iter::once;
+
 use rlp::Rlp;
 
 
-pub trait RlpPath {
-    fn get_bytes<'a>(&self, input: &'a[u8]) -> &'a[u8];
+#[derive(Clone, Debug, Default)]
+pub struct RlpPath {
+    path: Vec<usize>,
 }
 
-
-#[derive(Copy, Clone, Debug)]
-pub struct Empty {}
-
-impl RlpPath for Empty {
-    fn get_bytes<'a>(&self, input: &'a[u8]) -> &'a[u8] {
-        input
+impl RlpPath {
+    pub fn new(other: &RlpPath, i: usize) -> Self {
+        Self {
+            path: other.path.iter().copied().chain(once(i)).collect()
+        }
     }
-}
 
-
-#[derive(Copy, Clone, Debug)]
-pub struct ListNthValue<Parent: RlpPath> {
-    pub parent: Parent,
-    pub i: usize,
-}
-
-impl<Parent: RlpPath> ListNthValue<Parent> {
-    pub fn new(parent: Parent, i: usize) -> Self {
-        Self { parent, i }
-    }
-}
-
-impl<Parent: RlpPath> RlpPath for ListNthValue<Parent> {
-    fn get_bytes<'a>(&self, input: &'a[u8]) -> &'a[u8] {
-        Rlp::new(self.parent.get_bytes(input)).at(self.i).unwrap().data().unwrap()
+    pub fn get_subslice<'a>(&self, input: &'a[u8]) -> &'a[u8] {
+        let mut tmp = input;
+        for i in &self.path {
+            tmp = Rlp::new(tmp).at(*i).unwrap().data().unwrap()
+        }
+        tmp
     }
 }
