@@ -1,12 +1,13 @@
 //! Merkle trie implementation for Ethereum.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    sync::Arc,
-};
+use std::{collections::{HashMap, VecDeque}, sync::Arc};
+use std::borrow::Borrow;
+use std::iter::once;
+use std::ops::Deref;
 
+use ouroboros::self_referencing;
 use primitive_types::H256;
-use rlp::Rlp;
+use rlp::{Rlp, RlpStream};
 use sha3::{Digest, Keccak256};
 
 use merkle::{nibble, MerkleNode, MerkleValue};
@@ -32,23 +33,186 @@ use ops::{build, delete, get, insert};
 
 type Result<T> = std::result::Result<T, error::Error>;
 
-pub trait CachedDatabaseHandle {
-    fn get(&self, key: H256) -> Vec<u8>;
+#[derive(Clone, Debug, Default)]
+pub struct RlpPath {
+    path: Vec<usize>,
 }
 
-/// An immutable database handle.
+impl RlpPath {
+    pub fn new(other: &RlpPath, i: usize) -> Self {
+        Self {
+            path: other.path.iter().copied().chain(once(i)).collect()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.path.is_empty()
+    }
+
+    pub fn walk_path<'a>(&self, input: &'a[u8]) -> Rlp<'a> {
+        let mut rlp = Rlp::new(input);
+        for i in &self.path {
+            rlp = rlp.at(*i).unwrap()
+        }
+        rlp
+    }
+
+    pub fn get_subslice<'a>(&self, input: &'a[u8]) -> &'a[u8] {
+        if self.is_empty() {
+            return input;
+        }
+
+        let mut rlp = Rlp::new(input);
+        for i in &self.path {
+            rlp = rlp.at(*i).unwrap()
+        }
+        rlp.data().unwrap()
+    }
+}
+
+#[derive(Clone)]
+pub enum DbValueRef<'a> {
+    Plain(&'a[u8]),
+    Dashmap(Arc<dashmap::mapref::one::Ref<'a, H256, Vec<u8>>>),
+    Rocks(Arc<rocksdb_lib::DBPinnableSlice<'a>>),
+}
+
+impl<'a> std::fmt::Debug for DbValueRef<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
+impl<'a> PartialEq for DbValueRef<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deref().eq(other.deref())
+    }
+}
+
+impl<'a> Eq for DbValueRef<'a> { }
+
+impl<'a> Deref for DbValueRef<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Plain(bytes) => *bytes,
+            Self::Dashmap(r) => r.value(),
+            Self::Rocks(slice) => slice.deref(),
+        }
+    }
+}
+
+impl<'a> AsRef<[u8]> for DbValueRef<'a> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Plain(bytes) => *bytes,
+            Self::Dashmap(r) => r.value(),
+            Self::Rocks(slice) => slice.deref(),
+        }
+    }
+}
+
+#[self_referencing]
+pub struct RlpWithDbValueRef<'a> {
+    value_ref: DbValueRef<'a>,
+    rlp_path: RlpPath,
+    #[borrows(value_ref, rlp_path)]
+    #[covariant]
+    rlp: Rlp<'this>,
+}
+
+impl<'a> RlpWithDbValueRef<'a> {
+    fn get_ref(&self) -> DbValueRef<'a> {
+        self.borrow_value_ref().clone()
+    }
+}
+
+#[self_referencing]
+pub struct BytesWithDbValueRef<'a> {
+    value_ref: DbValueRef<'a>,
+    rlp_path: RlpPath,
+    #[borrows(value_ref, rlp_path)]
+    bytes: &'this [u8],
+}
+
+impl<'a> Clone for BytesWithDbValueRef<'a> {
+    fn clone(&self) -> Self {
+        make_bytes_wrapper!(self.borrow_value_ref().clone(), self.borrow_rlp_path().clone())
+    }
+}
+
+impl<'a> Deref for BytesWithDbValueRef<'a> {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.borrow_bytes()
+    }
+}
+
+impl<'a> AsRef<[u8]> for BytesWithDbValueRef<'a> {
+    fn as_ref(&self) -> &[u8] {
+        self.borrow_bytes()
+    }
+}
+
+impl<'a> rlp::Encodable for BytesWithDbValueRef<'a> {
+    fn rlp_append(&self, s: &mut RlpStream) {
+        self.deref().rlp_append(s)
+    }
+}
+
+impl<'a> std::fmt::Debug for BytesWithDbValueRef<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.deref().fmt(f)
+    }
+}
+
+impl<'a> PartialEq for BytesWithDbValueRef<'a> {
+    fn eq(&self, other: &Self) -> bool {
+        self.deref().eq(other.deref())
+    }
+}
+
+impl<'a> Eq for BytesWithDbValueRef<'a> { }
+
+#[macro_export]
+macro_rules! make_rlp_wrapper {
+    ( $value_ref:expr, $rlp_path:expr ) => {
+        {
+            RlpWithDbValueRefBuilder {
+                value_ref: $value_ref,
+                rlp_path: $rlp_path,
+                rlp_builder: |r: &DbValueRef, p: &RlpPath| p.walk_path(r)
+            }.build()
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! make_bytes_wrapper {
+    ( $value_ref:expr, $rlp_path:expr ) => {
+        {
+            BytesWithDbValueRefBuilder {
+                value_ref: $value_ref,
+                rlp_path: $rlp_path,
+                bytes_builder: |r: &DbValueRef, p: &RlpPath| p.get_subslice(r)
+            }.build()
+        }
+    };
+}
+
 pub trait Database {
-    /// Get a raw value from the database.
-    fn get(&self, key: H256) -> &[u8];
+    fn get(&self, key: H256) -> DbValueRef;
 }
 
 impl<'a, T: Database> Database for &'a T {
-    fn get(&self, key: H256) -> &[u8] {
+    fn get(&self, key: H256) -> DbValueRef {
         Database::get(*self, key)
     }
 }
 impl<T: Database> Database for Arc<T> {
-    fn get(&self, key: H256) -> &[u8] {
+    fn get(&self, key: H256) -> DbValueRef {
         Database::get(self.as_ref(), key)
     }
 }
@@ -135,12 +299,14 @@ pub fn insert<D: Database>(root: H256, database: &D, key: &[u8], value: &[u8]) -
     let nibble = nibble::from_key(key);
 
     let (new, subchange) = if root == empty_trie_hash!() {
-        insert::insert_by_empty(nibble, value)
+        let bytes = make_bytes_wrapper!(DbValueRef::Plain(value), RlpPath::default());
+        insert::insert_by_empty(nibble, bytes)
     } else {
-        let old =
-            MerkleNode::decode(&Rlp::new(database.get(root))).expect("Unable to decode Node value");
+        let rlp = make_rlp_wrapper!(database.get(root), RlpPath::default());
+        let old = MerkleNode::decode(rlp).expect("Unable to decode Node value");
         change.remove_raw(root);
-        insert::insert_by_node(old, nibble, value, database)
+        let bytes = make_bytes_wrapper!(DbValueRef::Plain(value), RlpPath::default());
+        insert::insert_by_node(old, nibble, bytes, database)
     };
     change.merge(&subchange);
     change.add_node(&new);
@@ -155,7 +321,8 @@ pub fn insert_empty<D: Database>(key: &[u8], value: &[u8]) -> (H256, Change) {
     let mut change = Change::default();
     let nibble = nibble::from_key(key);
 
-    let (new, subchange) = insert::insert_by_empty(nibble, value);
+    let bytes = make_bytes_wrapper!(DbValueRef::Plain(value), RlpPath::default());
+    let (new, subchange) = insert::insert_by_empty(nibble, bytes);
     change.merge(&subchange);
     change.add_node(&new);
 
@@ -172,8 +339,8 @@ pub fn delete<D: Database>(root: H256, database: &D, key: &[u8]) -> (H256, Chang
     let (new, subchange) = if root == empty_trie_hash!() {
         return (root, change);
     } else {
-        let old =
-            MerkleNode::decode(&Rlp::new(database.get(root))).expect("Unable to decode Node value");
+        let rlp = make_rlp_wrapper!(database.get(root), RlpPath::default());
+        let old = MerkleNode::decode(rlp).expect("Unable to decode Node value");
         change.remove_raw(root);
         delete::delete_by_node(old, nibble, database)
     };
@@ -201,7 +368,8 @@ pub fn build(map: &HashMap<Vec<u8>, Vec<u8>>) -> (H256, Change) {
 
     let mut node_map = HashMap::new();
     for (key, value) in map {
-        node_map.insert(nibble::from_key(key.as_ref()), value.as_ref());
+        let bytes = make_bytes_wrapper!(DbValueRef::Plain(value), RlpPath::default());
+        node_map.insert(nibble::from_key(key.as_ref()), bytes);
     }
 
     let (node, subchange) = build::build_node(&node_map);
@@ -213,13 +381,13 @@ pub fn build(map: &HashMap<Vec<u8>, Vec<u8>>) -> (H256, Change) {
 }
 
 /// Get a value given the root hash and the database.
-pub fn get<'a, 'b, D: Database>(root: H256, database: &'a D, key: &'b [u8]) -> Option<&'a [u8]> {
+pub fn get<'a, 'b, D: Database>(root: H256, database: &'a D, key: &'b [u8]) -> Option<BytesWithDbValueRef<'a>> {
     if root == empty_trie_hash!() {
         None
     } else {
         let nibble = nibble::from_key(key);
-        let node =
-            MerkleNode::decode(&Rlp::new(database.get(root))).expect("Unable to decode Node value");
+        let rlp = make_rlp_wrapper!(database.get(root), RlpPath::default());
+        let node = MerkleNode::decode(rlp).expect("Unable to decode Node value");
         get::get_by_node(node, nibble, database)
     }
 }

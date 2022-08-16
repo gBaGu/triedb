@@ -1,12 +1,11 @@
 use std::borrow::Borrow;
 use std::collections::{hash_map, HashMap};
+use std::ops::Deref;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use crate::merkle::MerkleValue;
-use crate::{
-    cache::CachedHandle, delete, empty_trie_hash, get, insert, CachedDatabaseHandle, Change,
-    Database, TrieMut,
-};
+use crate::{cache::CachedHandle, delete, empty_trie_hash, get, insert, Change, TrieMut, Database, DbValueRef, RlpWithDbValueRef, RlpWithDbValueRefBuilder, RlpPath, make_rlp_wrapper};
 
 use crate::MerkleNode;
 
@@ -40,13 +39,13 @@ where
 
     fn process_node(&mut self, merkle_node: &MerkleNode) {
         match merkle_node {
-            MerkleNode::Leaf(_, d) => self.childs.extend_from_slice(&(self.child_extractor)(*d)),
+            MerkleNode::Leaf(_, d) => self.childs.extend_from_slice(&(self.child_extractor)(d)),
             MerkleNode::Extension(_, merkle_value) => {
                 self.process_value(merkle_value);
             }
             MerkleNode::Branch(merkle_values, data) => {
                 if let Some(d) = data {
-                    self.childs.extend_from_slice(&(self.child_extractor)(*d))
+                    self.childs.extend_from_slice(&(self.child_extractor)(d))
                 }
                 for merkle_value in merkle_values {
                     self.process_value(merkle_value);
@@ -176,30 +175,32 @@ impl<D: DbCounter + Database> TrieCollection<D> {
         let mut referenced = vec![];
         for (key, value) in change.changes.into_iter().rev() {
             if let Some(value) = value {
-                let rlp = Rlp::new(&value);
-                let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
-                referenced.extend_from_slice(
-                    &ReachableHashes::collect(&node, child_extractor.clone()).childs()
-                );
-                let child = sorted.iter().enumerate().find(|(i, (key, _))| {
-                    match &node {
-                        MerkleNode::Branch(values, _) => {
-                            values.iter().any(|value| {
+                let child = {
+                    let rlp = make_rlp_wrapper!(DbValueRef::Plain(&value), RlpPath::default());
+                    let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
+                    referenced.extend_from_slice(
+                        &ReachableHashes::collect(&node, child_extractor.clone()).childs()
+                    );
+                    sorted.iter().enumerate().find(|(i, (key, _))| {
+                        match &node {
+                            MerkleNode::Branch(values, _) => {
+                                values.iter().any(|value| {
+                                    if let MerkleValue::Hash(k) = value {
+                                        return *k == *key;
+                                    }
+                                    false
+                                })
+                            }
+                            MerkleNode::Extension(_, value) => {
                                 if let MerkleValue::Hash(k) = value {
                                     return *k == *key;
                                 }
                                 false
-                            })
-                        }
-                        MerkleNode::Extension(_, value) => {
-                            if let MerkleValue::Hash(k) = value {
-                                return *k == *key;
                             }
-                            false
+                            MerkleNode::Leaf(_, _) => false
                         }
-                        MerkleNode::Leaf(_, _) => false
-                    }
-                });
+                    })
+                };
                 match child {
                     None => sorted.push((key, value)),
                     Some((i, _)) => sorted.insert(i, (key, value)),
@@ -251,14 +252,14 @@ impl<D: Database> TrieMut for DatabaseTrieMut<D> {
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        get(self.root, self, key).map(|v| v.into())
+        get(self.root, self, key).map(|v| v.to_vec())
     }
 }
 
 impl<D: Database> Database for DatabaseTrieMut<D> {
-    fn get(&self, key: H256) -> &[u8] {
+    fn get(&self, key: H256) -> DbValueRef {
         if let Some(bytes) = self.change_data.get(&key) {
-            &**bytes
+            DbValueRef::Plain(&**bytes)
         } else {
             self.database.borrow().get(key)
         }
@@ -348,8 +349,8 @@ impl DbCounter for MapWithCounterCached {
         match self.db.data.entry(key) {
             Entry::Occupied(_) => {}
             Entry::Vacant(v) => {
-                let rlp = Rlp::new(&value);
-                let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+                let rlp = make_rlp_wrapper!(DbValueRef::Plain(&value), RlpPath::default());
+                let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
                 trace!("inserting node {}=>{:?}", key, node);
                 for hash in ReachableHashes::collect(&node, child_extractor).childs() {
                     self.db.increase(hash);
@@ -382,8 +383,8 @@ impl DbCounter for MapWithCounterCached {
                 // in this code we lock data, so it's okay to check counter from separate function
                 if self.gc_count(key) == 0 {
                     let value = entry.remove();
-                    let rlp = Rlp::new(&value);
-                    let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+                    let rlp = make_rlp_wrapper!(DbValueRef::Plain(&value), RlpPath::default());
+                    let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
                     return ReachableHashes::collect(&node, child_extractor)
                         .childs()
                         .into_iter()
@@ -405,12 +406,11 @@ impl DbCounter for MapWithCounterCached {
     }
 }
 
-impl CachedDatabaseHandle for Arc<MapWithCounter> {
-    fn get(&self, key: H256) -> Vec<u8> {
-        self.data
+impl Database for Arc<MapWithCounter> {
+    fn get(&self, key: H256) -> DbValueRef {
+        DbValueRef::Dashmap(Arc::new(self.data
             .get(&key)
-            .unwrap_or_else(|| panic!("Value for {} not found in database", key))
-            .clone()
+            .unwrap_or_else(|| panic!("Value for {} not found in database", key))))
     }
 }
 
@@ -474,8 +474,6 @@ pub mod testing {
     use primitive_types::H256;
     use super::*;
 
-    use crate::{Database, CachedDatabaseHandle};
-
     use super::{MapWithCounter, DbCounter};
 
     #[derive(Default, Debug)]
@@ -526,14 +524,14 @@ pub mod testing {
         }
     }
 
-
-    impl<D: CachedDatabaseHandle> Database for AsyncCachedHandle<D> {
-        fn get(&self, key: H256) -> &[u8] {
-            if !self.cache.contains_key(key) {
-                self.cache.insert(key, self.db.get(key))
+    impl<D: Database> Database for AsyncCachedHandle<D> {
+        fn get(&self, key: H256) -> DbValueRef {
+            let slice = if !self.cache.contains_key(key) {
+                self.cache.insert(key, self.db.get(key).to_vec())
             } else {
                 self.cache.get(key).unwrap()
-            }
+            };
+            DbValueRef::Plain(slice)
         }
     }
     pub type MapWithCounterCached = AsyncCachedHandle<Arc<MapWithCounter>>;
@@ -547,8 +545,8 @@ pub mod testing {
             match self.db.data.entry(key) {
                 Entry::Occupied(_) => {}
                 Entry::Vacant(v) => {
-                    let rlp = Rlp::new(&value);
-                    let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+                    let rlp = make_rlp_wrapper!(DbValueRef::Plain(&value), RlpPath::default());
+                    let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
                     trace!("inserting node {}=>{:?}", key, node);
                     for hash in ReachableHashes::collect(&node, child_extractor).childs() {
                         self.db.increase(hash);
@@ -581,8 +579,8 @@ pub mod testing {
                     // in this code we lock data, so it's okay to check counter from separate function
                     if self.gc_count(key) == 0 {
                         let value = entry.remove();
-                        let rlp = Rlp::new(&value);
-                        let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+                        let rlp = make_rlp_wrapper!(DbValueRef::Plain(&value), RlpPath::default());
+                        let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
                         return ReachableHashes::collect(&node, child_extractor)
                             .childs()
                             .into_iter()
@@ -725,8 +723,8 @@ pub mod tests {
         // CHECK CHILDS counts
         println!("root={}", root_guard.root);
         let node = collection.database.get(root_guard.root);
-        let rlp = Rlp::new(&node);
-        let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+        let rlp = make_rlp_wrapper!(node, RlpPath::default());
+        let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
         let childs = ReachableHashes::collect(&node, no_childs).childs();
         assert_eq!(childs.len(), 2); // "bb..", "ffaa", check test doc comments
 
@@ -748,8 +746,8 @@ pub mod tests {
         assert_eq!(collection.database.gc_count(another_root.root), 1);
 
         let node = collection.database.get(another_root.root);
-        let rlp = Rlp::new(&node);
-        let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+        let rlp = make_rlp_wrapper!(node, RlpPath::default());
+        let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
         let another_root_childs = ReachableHashes::collect(&node, no_childs).childs();
         assert_eq!(another_root_childs.len(), 2); // "bb..", "ffaa", check test doc comments
 
@@ -786,8 +784,8 @@ pub mod tests {
         let latest_root = collection.apply_increase(patch, no_childs);
 
         let node = collection.database.get(latest_root.root);
-        let rlp = Rlp::new(&node);
-        let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+        let rlp = make_rlp_wrapper!(node, RlpPath::default());
+        let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
         let latest_root_childs = ReachableHashes::collect(&node, no_childs).childs();
         assert_eq!(latest_root_childs.len(), 2); // "bb..", "ffaa", check test doc comments
 

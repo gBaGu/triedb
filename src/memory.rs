@@ -64,7 +64,7 @@ impl TrieMut for MemoryTrieMut {
     }
 
     fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
-        get(self.root, &self.database, key).map(|v| v.into())
+        get(self.root, &self.database, key).map(|v| v.to_vec())
     }
 }
 

@@ -1,21 +1,18 @@
 use rlp::{self, Rlp};
 
-use crate::{
-    merkle::{nibble::NibbleVec, MerkleNode, MerkleValue},
-    Database,
-};
+use crate::{merkle::{nibble::NibbleVec, MerkleNode, MerkleValue}, Database, BytesWithDbValueRef, DbValueRef, RlpPath, RlpWithDbValueRef, RlpWithDbValueRefBuilder, make_rlp_wrapper};
 
 pub fn get_by_value<'a, D: Database>(
     merkle: MerkleValue<'a>,
     nibble: NibbleVec,
     database: &'a D,
-) -> Option<&'a [u8]> {
+) -> Option<BytesWithDbValueRef<'a>> {
     match merkle {
         MerkleValue::Empty => None,
         MerkleValue::Full(subnode) => get_by_node(subnode.as_ref().clone(), nibble, database),
         MerkleValue::Hash(h) => {
-            let subnode = MerkleNode::decode(&Rlp::new(database.get(h)))
-                .expect("Unable to decode Node value");
+            let rlp = make_rlp_wrapper!(database.get(h), RlpPath::default());
+            let subnode = MerkleNode::decode(rlp).expect("Unable to decode Node value");
             get_by_node(subnode, nibble, database)
         }
     }
@@ -25,7 +22,7 @@ pub fn get_by_node<'a, D: Database>(
     node: MerkleNode<'a>,
     nibble: NibbleVec,
     database: &'a D,
-) -> Option<&'a [u8]> {
+) -> Option<BytesWithDbValueRef<'a>> {
     match node {
         MerkleNode::Leaf(node_nibble, node_value) => {
             if node_nibble == nibble {

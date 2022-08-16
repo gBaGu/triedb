@@ -1,12 +1,9 @@
 use rlp::{self, Rlp};
 
-use crate::{
-    merkle::{
-        nibble::{Nibble, NibbleVec},
-        MerkleNode, MerkleValue,
-    },
-    Change, Database,
-};
+use crate::{merkle::{
+    nibble::{Nibble, NibbleVec},
+    MerkleNode, MerkleValue,
+}, Change, Database, RlpWithDbValueRef, RlpWithDbValueRefBuilder, BytesWithDbValueRef, RlpPath, DbValueRef, make_rlp_wrapper};
 
 fn find_and_remove_child<'a, D: Database>(
     merkle: MerkleValue<'a>,
@@ -18,8 +15,8 @@ fn find_and_remove_child<'a, D: Database>(
         MerkleValue::Empty => panic!(),
         MerkleValue::Full(ref sub_node) => sub_node.as_ref().clone(),
         MerkleValue::Hash(h) => {
-            let sub_node =
-                MerkleNode::decode(&Rlp::new(database.get(h))).expect("Unable to decode value");
+            let rlp = make_rlp_wrapper!(database.get(h), RlpPath::default());
+            let sub_node = MerkleNode::decode(rlp).expect("Unable to decode value");
             change.remove_node(&sub_node);
             sub_node
         }
@@ -56,14 +53,14 @@ fn collapse_extension(
 
 fn nonempty_node_count<'a, 'b>(
     nodes: &'b [MerkleValue<'a>; 16],
-    additional: &'b Option<&'a [u8]>,
+    additional: &'b Option<BytesWithDbValueRef<'a>>,
 ) -> usize {
     additional.iter().count() + nodes.iter().filter(|v| v != &&MerkleValue::Empty).count()
 }
 
 fn collapse_branch<'a, D: Database>(
     node_nodes: [MerkleValue<'a>; 16],
-    node_additional: Option<&'a [u8]>,
+    node_additional: Option<BytesWithDbValueRef<'a>>,
     database: &'a D,
 ) -> (MerkleNode<'a>, Change) {
     let mut change = Change::default();
@@ -122,8 +119,8 @@ pub fn delete_by_child<'a, D: Database>(
             new_node
         }
         MerkleValue::Hash(h) => {
-            let sub_node = MerkleNode::decode(&Rlp::new(database.get(h)))
-                .expect("Unable to decode Node value");
+            let rlp = make_rlp_wrapper!(database.get(h), RlpPath::default());
+            let sub_node = MerkleNode::decode(rlp).expect("Unable to decode Node value");
             change.remove_node(&sub_node);
             let (new_node, subchange) = delete_by_node(sub_node, nibble, database);
             change.merge(&subchange);

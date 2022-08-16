@@ -2,7 +2,7 @@ use std::{borrow::Borrow, sync::Arc};
 
 use primitive_types::H256;
 use rlp::Rlp;
-use crate::{merkle::{MerkleNode, MerkleValue}, Database};
+use crate::{merkle::{MerkleNode, MerkleValue}, RlpWithDbValueRef, RlpWithDbValueRefBuilder, DbValueRef, Database, RlpPath, make_rlp_wrapper};
 
 use anyhow::{anyhow, Result};
 use log::*;
@@ -59,9 +59,9 @@ where
                 .get(hash);
             trace!("raw bytes: {:?}", bytes);
 
-            let rlp = Rlp::new(bytes);
-            trace!("rlp: {:?}", rlp);
-            let node = MerkleNode::decode(&rlp)?;
+            let rlp = make_rlp_wrapper!(bytes.clone(), RlpPath::default());
+            trace!("rlp: {:?}", rlp.borrow_rlp());
+            let node = MerkleNode::decode(rlp)?;
             debug!("node: {:?}", node);
 
             self.process_node(nibble, &node)?;

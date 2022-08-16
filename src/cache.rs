@@ -5,7 +5,7 @@ use std::{
 
 use primitive_types::H256;
 
-use crate::{CachedDatabaseHandle, Database};
+use crate::{DbValueRef, Database};
 
 #[derive(Default, Debug)]
 pub struct CachedHandle<D> {
@@ -22,7 +22,7 @@ impl<D: Clone> Clone for CachedHandle<D> {
     }
 }
 
-impl<D: CachedDatabaseHandle> CachedHandle<D> {
+impl<D: Database> CachedHandle<D> {
     pub fn new(db: D) -> Self {
         Self {
             db,
@@ -35,13 +35,14 @@ impl<D: CachedDatabaseHandle> CachedHandle<D> {
     }
 }
 
-impl<D: CachedDatabaseHandle> Database for CachedHandle<D> {
-    fn get(&self, key: H256) -> &[u8] {
-        if !self.cache.contains_key(key) {
-            self.cache.insert(key, self.db.get(key))
+impl<D: Database> Database for CachedHandle<D> {
+    fn get(&self, key: H256) -> DbValueRef {
+        let slice = if !self.cache.contains_key(key) {
+            self.cache.insert(key, self.db.get(key).to_vec())
         } else {
             self.cache.get(key).unwrap()
-        }
+        };
+        DbValueRef::Plain(slice)
     }
 }
 

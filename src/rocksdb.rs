@@ -3,6 +3,8 @@
 //use asterix to avoid unresolved import https://github.com/rust-analyzer/rust-analyzer/issues/7459#issuecomment-907714513
 use derivative::*;
 use std::borrow::Borrow;
+use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::merkle::MerkleNode;
 use log::*;
@@ -13,11 +15,7 @@ use rocksdb_lib::{ColumnFamily, MergeOperands, OptimisticTransactionDB, Transact
 // We use optimistica transaction, to allow regular `get` operation execute without lock timeouts.
 type DB = OptimisticTransactionDB;
 
-use crate::{
-    cache::CachedHandle,
-    gc::{DbCounter, ReachableHashes},
-    CachedDatabaseHandle,
-};
+use crate::{cache::CachedHandle, gc::{DbCounter, ReachableHashes}, Database, DbValueRef, RlpWithDbValueRef, RlpWithDbValueRefBuilder, RlpPath, make_rlp_wrapper};
 
 const EXCLUSIVE: bool = true;
 
@@ -148,13 +146,13 @@ fn deserialize_counter(counter: &[u8]) -> i64 {
     i64::from_le_bytes(bytes)
 }
 
-impl<'a, D: Borrow<DB>> CachedDatabaseHandle for RocksDatabaseHandle<'a, D> {
-    fn get(&self, key: H256) -> Vec<u8> {
-        self.db
+impl<'a, D: Borrow<DB>> Database for RocksDatabaseHandle<'a, D> {
+    fn get(&self, key: H256) -> DbValueRef {
+        DbValueRef::Rocks(Arc::new(self.db
             .borrow()
-            .get(key.as_ref())
+            .get_pinned(key.as_ref())
             .expect("Error on reading database")
-            .unwrap_or_else(|| panic!("Value for {} not found in database", key))
+            .unwrap_or_else(|| panic!("Value for {} not found in database", key))))
     }
 }
 
@@ -192,8 +190,8 @@ impl<'a, D: Borrow<DB>> DbCounter for RocksHandle<'a, D> {
     where
         F: FnMut(&[u8]) -> Vec<H256>,
     {
-        let rlp = Rlp::new(&value);
-        let node = MerkleNode::decode(&rlp).expect("Data should be decodable node");
+        let rlp = make_rlp_wrapper!(DbValueRef::Plain(&value), RlpPath::default());
+        let node = MerkleNode::decode(rlp).expect("Data should be decodable node");
         let childs = ReachableHashes::collect(&node, &mut child_extractor).childs();
         retry! {
             let db = self.db.db.borrow();
@@ -268,8 +266,8 @@ impl<'a, D: Borrow<DB>> DbCounter for RocksHandle<'a, D> {
 
 
                 let childs = cached_childs.take().unwrap_or_else(||{
-                    let rlp = Rlp::new(&value);
-                    let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+                    let rlp = make_rlp_wrapper!(DbValueRef::Plain(&value), RlpPath::default());
+                    let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
                     ReachableHashes::collect(&node, &mut child_extractor).childs()
                 });
 
@@ -333,7 +331,6 @@ mod tests {
     use crate::gc::RootGuard;
     use crate::impls::tests::{Data, K};
     use crate::mutable::TrieMut;
-    use crate::Database;
 
     fn no_childs(_: &[u8]) -> Vec<H256> {
         vec![]
@@ -385,8 +382,8 @@ mod tests {
         // CHECK CHILDS counts
         println!("root={}", root_guard.root);
         let node = collection.database.get(root_guard.root);
-        let rlp = Rlp::new(&node);
-        let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+        let rlp = make_rlp_wrapper!(node, RlpPath::default());
+        let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
         let childs = ReachableHashes::collect(&node, no_childs).childs();
         assert_eq!(childs.len(), 2); // "bb..", "ffaa", check test doc comments
 
@@ -408,8 +405,8 @@ mod tests {
         assert_eq!(collection.database.gc_count(another_root_guard.root), 1);
 
         let node = collection.database.get(another_root_guard.root);
-        let rlp = Rlp::new(&node);
-        let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+        let rlp = make_rlp_wrapper!(node, RlpPath::default());
+        let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
         let another_root_childs = ReachableHashes::collect(&node, no_childs).childs();
         assert_eq!(another_root_childs.len(), 2); // "bb..", "ffaa", check test doc comments
 
@@ -448,8 +445,8 @@ mod tests {
         collection.database.gc_pin_root(latest_root_guard.root);
 
         let node = collection.database.get(latest_root_guard.root);
-        let rlp = Rlp::new(&node);
-        let node = MerkleNode::decode(&rlp).expect("Unable to decode Merkle Node");
+        let rlp = make_rlp_wrapper!(node, RlpPath::default());
+        let node = MerkleNode::decode(rlp).expect("Unable to decode Merkle Node");
         let latest_root_childs = ReachableHashes::collect(&node, no_childs).childs();
         assert_eq!(latest_root_childs.len(), 2); // "bb..", "ffaa", check test doc comments
 

@@ -1,21 +1,18 @@
 use std::collections::HashMap;
 
-use crate::{
-    merkle::{
-        empty_nodes,
-        nibble::{self, Nibble, NibbleVec},
-        MerkleNode, MerkleValue,
-    },
-    Change,
-};
+use crate::{merkle::{
+    empty_nodes,
+    nibble::{self, Nibble, NibbleVec},
+    MerkleNode, MerkleValue,
+}, Change, BytesWithDbValueRef, DbValueRef};
 
-fn make_submap<'a, 'b: 'a, T: Iterator<Item = (&'a NibbleVec, &'a &'b [u8])>>(
+fn make_submap<'a, 'b: 'a, T: Iterator<Item = (&'a NibbleVec, &'a BytesWithDbValueRef<'b>)>>(
     common_len: usize,
     map: T,
-) -> HashMap<NibbleVec, &'b [u8]> {
+) -> HashMap<NibbleVec, BytesWithDbValueRef<'b>> {
     let mut submap = HashMap::new();
-    for (key, &value) in map {
-        submap.insert(key[common_len..].into(), value);
+    for (key, value) in map {
+        submap.insert(key[common_len..].into(), value.clone());
     }
     submap
 }
@@ -27,13 +24,14 @@ pub fn build_value(node: MerkleNode<'_>) -> (MerkleValue<'_>, Change) {
     (value, change)
 }
 
-pub fn build_node<'a>(map: &HashMap<NibbleVec, &'a [u8]>) -> (MerkleNode<'a>, Change) {
+pub fn build_node<'a>(map: &HashMap<NibbleVec, BytesWithDbValueRef<'a>>) -> (MerkleNode<'a>, Change) {
     let mut change = Change::default();
 
     assert!(!map.is_empty());
     if map.len() == 1 {
         let key = map.keys().next().unwrap();
-        return (MerkleNode::Leaf(key.clone(), map.get(key).unwrap()), change);
+        let bytes = map.get(key).unwrap().clone();
+        return (MerkleNode::Leaf(key.clone(), bytes), change);
     }
 
     debug_assert!(map.len() > 1);
@@ -76,7 +74,7 @@ pub fn build_node<'a>(map: &HashMap<NibbleVec, &'a [u8]>) -> (MerkleNode<'a>, Ch
         let additional = map
             .iter()
             .find(|&(key, _value)| key.is_empty())
-            .map(|(_key, value)| *value);
+            .map(|(_key, value)| value.clone());
 
         (MerkleNode::Branch(nodes, additional), change)
     }

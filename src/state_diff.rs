@@ -2,7 +2,7 @@ use std::borrow::Borrow;
 use std::ops::{Deref, DerefMut};
 use std::sync::RwLock;
 
-use crate::Database;
+use crate::{BytesWithDbValueRef, BytesWithDbValueRefBuilder, DbValueRef, Database, RlpPath, RlpWithDbValueRef, RlpWithDbValueRefBuilder, make_rlp_wrapper, make_bytes_wrapper};
 use crate::gc::ReachableHashes;
 use crate::merkle::nibble::{self, Nibble, NibbleSlice, NibbleVec};
 use crate::merkle::{MerkleNode, MerkleValue};
@@ -109,7 +109,7 @@ impl<'a> MerkleValueExt<'a> for MerkleValue<'a> {
             Self::Empty => return None,
             Self::Full(n) => KeyedMerkleNode::Partial(n.deref().clone()),
             Self::Hash(h) =>{
-                let bytes = database.get(*h);
+                let bytes = make_bytes_wrapper!(database.get(*h), RlpPath::default());
                 KeyedMerkleNode::FullEncoded(*h, bytes)
             } 
         })
@@ -144,7 +144,7 @@ enum ComparePathResult {
 enum KeyedMerkleNode<'a> {
     // Merkle node is only exist as inlined node
     Partial(MerkleNode<'a>),
-    FullEncoded(H256, &'a[u8]),
+    FullEncoded(H256, BytesWithDbValueRef<'a>),
 }
 
 impl<'a> KeyedMerkleNode<'a> {
@@ -158,8 +158,8 @@ impl<'a> KeyedMerkleNode<'a> {
         match self {
             Self::Partial(n) => n.clone(),
             Self::FullEncoded(_, n) =>  {
-                let rlp = Rlp::new(n);
-                MerkleNode::decode(&rlp).expect("Cannot deserialize value")
+                let rlp = make_rlp_wrapper!(n.borrow_value_ref().clone(), n.borrow_rlp_path().clone());
+                MerkleNode::decode(rlp).expect("Cannot deserialize value")
             }
         }
     }
@@ -200,14 +200,14 @@ impl<DB: Database + Send+ Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + Sy
                 vec![]
             }
             (true, false) => {
-                let bytes = db.get(right_tree_cursor);
+                let bytes = make_bytes_wrapper!(db.get(right_tree_cursor), RlpPath::default());
                 // eprintln!("right raw bytes: {:?}", bytes);
 
                 let right_node = KeyedMerkleNode::FullEncoded(right_tree_cursor, bytes);
                 self.deep_insert(right_nibble, right_node)
             }
             (false, true) => {
-                let bytes = db.get(left_tree_cursor);
+                let bytes = make_bytes_wrapper!(db.get(left_tree_cursor), RlpPath::default());
                 // eprintln!("left raw bytes: {:?}", bytes);
 
 
@@ -215,11 +215,11 @@ impl<DB: Database + Send+ Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + Sy
                 self.deep_remove(left_nibble, left_node)
             }
             (false, false) => {
-                let bytes = db.get(left_tree_cursor);
+                let bytes = make_bytes_wrapper!(db.get(left_tree_cursor), RlpPath::default());
                 // eprintln!("left raw bytes: {:?}", bytes);
                 let left_node = KeyedMerkleNode::FullEncoded(left_tree_cursor, bytes);
 
-                let bytes = db.get(right_tree_cursor);
+                let bytes = make_bytes_wrapper!(db.get(right_tree_cursor), RlpPath::default());
                 // eprintln!("right raw bytes: {:?}", bytes);
 
                 let right_node = KeyedMerkleNode::FullEncoded(right_tree_cursor, bytes);
@@ -282,14 +282,14 @@ impl<DB: Database + Send+ Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + Sy
                         "Diff work only with fixed sized key"
                     );
                     // if node is not same then it replace of new node
-                    changes.extend_from_slice(&self.deep_remove(left_nibble, left_node));
-                    changes.extend_from_slice(&self.deep_insert(right_nibble, right_node))
+                    changes.extend_from_slice(&self.deep_remove(left_nibble, left_node.clone()));
+                    changes.extend_from_slice(&self.deep_insert(right_nibble, right_node.clone()))
                 }
             }
             // Leaf was replaced by subtree.
             (MerkleNode::Leaf(_lnibbles, ldata), rnode) => {
-                changes.extend_from_slice(&self.deep_remove(left_nibble, left_node));
-                changes.extend_from_slice(&self.deep_insert(right_nibble, right_node));
+                changes.extend_from_slice(&self.deep_remove(left_nibble, left_node.clone()));
+                changes.extend_from_slice(&self.deep_insert(right_nibble, right_node.clone()));
             }
             // We found extension at left part that differ from node from right.
             // Go deeper to find any branch or leaf.
@@ -304,7 +304,7 @@ impl<DB: Database + Send+ Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + Sy
                     e_nibbles,
                     ldata,
                     right_nibble,
-                    right_node,
+                    right_node.clone(),
                 ));
             }
             // Branches on same level, but values were changed.
@@ -348,7 +348,7 @@ impl<DB: Database + Send+ Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + Sy
                     values,
                     mb_data,
                     right_nibble,
-                    right_node,
+                    right_node.clone(),
                 ));
             } // We can make shortcut for leaf.
               // (lnode, MerkleNode::Leaf(_lnibbles, rdata)) => {
@@ -458,7 +458,7 @@ impl<DB: Database + Send+ Sync, F: FnMut(&[u8]) -> Vec<H256> + Clone + Send + Sy
         &self,
         left_nibble_prefix: NibbleVec,
         left_values: [MerkleValue; 16],
-        mb_data: Option<&[u8]>,
+        mb_data: Option<BytesWithDbValueRef>,
         right_nibble: NibbleVec,
         right_node: KeyedMerkleNode,
     ) -> Vec<Change> {
@@ -613,7 +613,7 @@ mod tests {
     use tracing::metadata::LevelFilter;
     use tracing_subscriber::fmt::format::FmtSpan;
 
-    use crate::CachedDatabaseHandle;
+    use crate::DbValueRef;
     use crate::gc::{DbCounter, RootGuard};
     use crate::gc::MapWithCounter;
     use crate::gc::TrieCollection;
@@ -880,8 +880,8 @@ mod tests {
             _ => None
         }.unwrap();
 
-        let rlp = Rlp::new(raw_v);
-        let v = MerkleNode::decode(&rlp).unwrap();
+        let rlp = make_rlp_wrapper!(DbValueRef::Plain(raw_v), RlpPath::default());
+        let v = MerkleNode::decode(rlp).unwrap();
 
         dbg!(v);
 
